@@ -84,13 +84,73 @@ def create_docx(text):
     buf.seek(0)
     return buf
 
+
+def create_pdf(text):
+    """Create a simple PDF from plain text using reportlab."""
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.pdfgen import canvas
+    except Exception:
+        raise RuntimeError("reportlab is required to generate PDF. Install with: pip install reportlab")
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    width, height = letter
+    margin = 72
+    y = height - margin
+    max_width = width - 2 * margin
+    # simple line wrap
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    lines = []
+    for paragraph in text.splitlines():
+        if not paragraph:
+            lines.append("")
+            continue
+        words = paragraph.split()
+        line = ""
+        for w in words:
+            test = (line + " " + w).strip()
+            if stringWidth(test, "Helvetica", 10) < max_width:
+                line = test
+            else:
+                lines.append(line)
+                line = w
+        if line:
+            lines.append(line)
+
+    for line in lines:
+        if y < margin:
+            c.showPage()
+            y = height - margin
+        c.setFont("Helvetica", 10)
+        c.drawString(margin, y, line)
+        y -= 12
+
+    c.save()
+    buf.seek(0)
+    return buf
+
 # Load environment variables
 load_dotenv()
 groq_api_key = os.getenv("GROQ_API_KEY")
 flow = ResumeFlow(groq_api_key)
 
 st.set_page_config(page_title="Resume Multi-Agent", layout="wide")
-st.title("Resume Multi-Agent Chat")
+
+# Gentle theme / peaceful colors
+st.markdown(
+    """
+    <style>
+    .stApp { background: linear-gradient(180deg, #f7fbfc 0%, #f1f7f8 100%); }
+    .sidebar .sidebar-content { background: #ffffffcc; border-radius: 8px; padding: 12px }
+    .card { background: #ffffff; padding: 12px; border-radius: 8px; box-shadow: 0 1px 6px rgba(16,24,40,0.06); }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("Resume Analyser & Builder")
+st.subheader("Smart, fast resume analysis and tailored rewrites")
 
 
 if "chat_history" not in st.session_state:
@@ -104,8 +164,14 @@ st.markdown("""
 Upload your resume and paste the job description. Click 'Analyze and Refine Resume' to get feedback and a tailored resume.
 """)
 
-uploaded_file = st.file_uploader("Upload Resume (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"])
-jd_text = st.text_area("Paste Job Description", height=200)
+# Sidebar: inputs
+with st.sidebar.expander("Inputs", expanded=True):
+    uploaded_file = st.file_uploader("Upload Resume (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"])
+    jd_text = st.text_area("Paste Job Description", height=200)
+    export_same_format = st.checkbox("Export in same format as uploaded (if supported)", value=True)
+    max_iterations = st.number_input("Max refinement iterations", min_value=1, max_value=5, value=3)
+    st.markdown("\n")
+    st.markdown("Need a quick tip: upload a clean resume PDF or DOCX for best results.")
 
 
 
@@ -140,10 +206,53 @@ if st.button("Analyze and Refine Resume"):
         st.session_state.chat_history = []
         with st.spinner("Analyzing and refining resume..."):
             resume_text = extract_text_from_file(uploaded_file)
-            chat_turns, refined_resume, original_resume = process_resume(jd_text, resume_text)
+            # Preliminary JD analysis for preview / scoring
+            try:
+                jd_analysis = flow.jd_analyzer.analyze(jd_text)
+            except Exception:
+                jd_analysis = {"skills": [], "tone": "", "keywords": []}
+
+            # compute simple scores
+            def compute_scores(jd_analysis, resume_text):
+                skills = jd_analysis.get("skills", []) or []
+                keywords = jd_analysis.get("keywords", []) or []
+                rt = (resume_text or "").lower()
+                skill_matches = sum(1 for s in skills if s.lower() in rt)
+                keyword_matches = sum(1 for k in keywords if k.lower() in rt)
+                skill_score = round((skill_matches / len(skills) * 5) if skills else 0, 1)
+                keyword_score = round((keyword_matches / len(keywords) * 5) if keywords else 0, 1)
+                tone = jd_analysis.get("tone", "").lower()
+                tone_score = 5.0 if tone and tone in rt else 3.0
+                # normalize
+                def clamp(x):
+                    if x is None:
+                        return 0.0
+                    return max(0.0, min(5.0, x))
+                return {"skill_score": clamp(skill_score), "keyword_score": clamp(keyword_score), "tone_score": clamp(tone_score)}
+
+            scores = compute_scores(jd_analysis, resume_text)
+
+            # prepare improvisation ideas
+            missing_skills = [s for s in (jd_analysis.get("skills") or []) if s.lower() not in (resume_text or "").lower()]
+            improv_ideas = []
+            if missing_skills:
+                improv_ideas.append(f"Consider adding or emphasizing these skills: {', '.join(missing_skills[:8])}")
+            if jd_analysis.get("keywords"):
+                missing_kw = [k for k in jd_analysis.get("keywords") if k.lower() not in (resume_text or "").lower()]
+                if missing_kw:
+                    improv_ideas.append(f"Include important keywords: {', '.join(missing_kw[:8])}")
+
+            # Run iterative refinement
+            chat_turns, refined_resume, original_resume = process_resume(jd_text, resume_text, max_loops=max_iterations)
             st.session_state.original_resume = original_resume
             st.session_state.refined_resume = refined_resume
             st.session_state.chat_history.extend(chat_turns)
+
+            # store analysis preview in session for right column
+            st.session_state.jd_analysis = jd_analysis
+            st.session_state.scores = scores
+            st.session_state.improv_ideas = improv_ideas
+            st.session_state.uploaded_type = uploaded_file.type
 
 
 
@@ -154,14 +263,77 @@ for msg in st.session_state.chat_history:
         with st.container():
             st.markdown(f"<div style='text-align: right; background: #e6f7ff; padding: 10px; border-radius: 10px; margin: 5px 0;'>{msg['content']}</div>", unsafe_allow_html=True)
 
+# Feedback & Analysis section (appears under Supervisor feedback)
+jd_analysis = st.session_state.get("jd_analysis")
+scores = st.session_state.get("scores")
+improv_ideas = st.session_state.get("improv_ideas")
+if jd_analysis or scores or improv_ideas:
+    st.markdown("---")
+    st.header("Feedback & Analysis")
+    # JD analysis
+    if jd_analysis:
+        st.subheader("JD Analysis")
+        try:
+            st.json(jd_analysis)
+        except Exception:
+            st.write(str(jd_analysis))
+    # Scores
+    if scores:
+        st.subheader("Analysis Scores (out of 5)")
+        try:
+            keys = list(scores.keys())
+            cols = st.columns(len(keys)) if keys else [st]
+            for i, k in enumerate(keys):
+                cols[i].metric(k.replace("_", " ").title(), scores[k])
+        except Exception:
+            st.write(scores)
+    # Improvisation ideas
+    if improv_ideas:
+        st.subheader("Improvisation Ideas")
+        for idea in improv_ideas:
+            st.info(idea)
+
 
 # Show download button for final refined resume only
 if st.session_state.refined_resume:
     st.markdown("---")
-    docx_buf = create_docx(st.session_state.refined_resume)
-    st.download_button(
-        label="Download Refined Resume as DOCX",
-        data=docx_buf,
-        file_name="refined_resume.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    )
+    # Decide output format
+    out_buf = None
+    out_filename = "refined_resume.docx"
+    out_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    try:
+        prefer_same = export_same_format
+    except NameError:
+        prefer_same = True
+
+    uploaded_type = st.session_state.get("uploaded_type", None)
+    if prefer_same and uploaded_type:
+        if "pdf" in uploaded_type:
+            try:
+                out_buf = create_pdf(st.session_state.refined_resume)
+                out_filename = "refined_resume.pdf"
+                out_mime = "application/pdf"
+            except Exception as e:
+                st.warning(f"PDF generation failed: {e}. Falling back to DOCX.")
+                out_buf = create_docx(st.session_state.refined_resume)
+        elif "word" in uploaded_type or "officedocument.wordprocessingml" in uploaded_type or "docx" in uploaded_type:
+            out_buf = create_docx(st.session_state.refined_resume)
+            out_filename = "refined_resume.docx"
+            out_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        elif "text" in uploaded_type or "plain" in uploaded_type:
+            out_buf = io.BytesIO(st.session_state.refined_resume.encode("utf-8"))
+            out_filename = "refined_resume.txt"
+            out_mime = "text/plain"
+        else:
+            out_buf = create_docx(st.session_state.refined_resume)
+    else:
+        # default to DOCX
+        out_buf = create_docx(st.session_state.refined_resume)
+
+    if out_buf is not None:
+        st.download_button(
+            label=f"Download Refined Resume ({out_filename.split('.')[-1].upper()})",
+            data=out_buf,
+            file_name=out_filename,
+            mime=out_mime,
+        )
